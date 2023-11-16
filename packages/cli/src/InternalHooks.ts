@@ -5,6 +5,7 @@ import { Service } from 'typedi';
 import { snakeCase } from 'change-case';
 import { BinaryDataManager } from 'n8n-core';
 import type {
+	AuthenticationMethod,
 	ExecutionStatus,
 	INodesGraphResult,
 	IRun,
@@ -30,6 +31,7 @@ import type { User } from '@db/entities/User';
 import { N8N_VERSION } from '@/constants';
 import * as Db from '@/Db';
 import { NodeTypes } from './NodeTypes';
+import type { ExecutionMetadata } from './databases/entities/ExecutionMetadata';
 
 function userToPayload(user: User): {
 	userId: string;
@@ -51,7 +53,11 @@ function userToPayload(user: User): {
 export class InternalHooks implements IInternalHooksClass {
 	private instanceId: string;
 
-	constructor(private telemetry: Telemetry, private nodeTypes: NodeTypes) {}
+	constructor(
+		private telemetry: Telemetry,
+		private nodeTypes: NodeTypes,
+		private roleService: RoleService,
+	) {}
 
 	async init(instanceId: string) {
 		this.instanceId = instanceId;
@@ -76,6 +82,7 @@ export class InternalHooks implements IInternalHooksClass {
 			n8n_multi_user_allowed: diagnosticInfo.n8n_multi_user_allowed,
 			smtp_set_up: diagnosticInfo.smtp_set_up,
 			ldap_allowed: diagnosticInfo.ldap_allowed,
+			saml_enabled: diagnosticInfo.saml_enabled,
 		};
 
 		return Promise.all([
@@ -155,7 +162,7 @@ export class InternalHooks implements IInternalHooksClass {
 
 		let userRole: 'owner' | 'sharee' | undefined = undefined;
 		if (user.id && workflow.id) {
-			const role = await RoleService.getUserRoleForWorkflow(user.id, workflow.id);
+			const role = await this.roleService.getUserRoleForWorkflow(user.id, workflow.id);
 			if (role) {
 				userRole = role.name === 'owner' ? 'owner' : 'sharee';
 			}
@@ -247,7 +254,17 @@ export class InternalHooks implements IInternalHooksClass {
 		executionId: string,
 		executionMode: WorkflowExecuteMode,
 		workflowData?: IWorkflowBase,
+		executionMetadata?: ExecutionMetadata[],
 	): Promise<void> {
+		let metaData;
+		try {
+			if (executionMetadata) {
+				metaData = executionMetadata.reduce((acc, meta) => {
+					return { ...acc, [meta.key]: meta.value };
+				}, {});
+			}
+		} catch {}
+
 		void Promise.all([
 			eventBus.sendWorkflowEvent({
 				eventName: 'n8n.workflow.crashed',
@@ -256,6 +273,7 @@ export class InternalHooks implements IInternalHooksClass {
 					isManual: executionMode === 'manual',
 					workflowId: workflowData?.id?.toString(),
 					workflowName: workflowData?.name,
+					metaData,
 				},
 			}),
 		]);
@@ -267,11 +285,11 @@ export class InternalHooks implements IInternalHooksClass {
 		runData?: IRun,
 		userId?: string,
 	): Promise<void> {
-		const promises = [Promise.resolve()];
-
 		if (!workflow.id) {
-			return Promise.resolve();
+			return;
 		}
+
+		const promises = [];
 
 		const properties: IExecutionTrackProperties = {
 			workflow_id: workflow.id,
@@ -284,6 +302,10 @@ export class InternalHooks implements IInternalHooksClass {
 			properties.user_id = userId;
 		}
 
+		if (runData?.data.resultData.error?.message?.includes('canceled')) {
+			runData.status = 'canceled';
+		}
+
 		properties.success = !!runData?.finished;
 
 		let executionStatus: ExecutionStatus;
@@ -291,6 +313,8 @@ export class InternalHooks implements IInternalHooksClass {
 			executionStatus = 'crashed';
 		} else if (runData?.status === 'waiting' || runData?.data?.waitTill) {
 			executionStatus = 'waiting';
+		} else if (runData?.status === 'canceled') {
+			executionStatus = 'canceled';
 		} else {
 			executionStatus = properties.success ? 'success' : 'failed';
 		}
@@ -342,8 +366,7 @@ export class InternalHooks implements IInternalHooksClass {
 
 				let userRole: 'owner' | 'sharee' | undefined = undefined;
 				if (userId) {
-					// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
-					const role = await RoleService.getUserRoleForWorkflow(userId, workflow.id);
+					const role = await this.roleService.getUserRoleForWorkflow(userId, workflow.id);
 					if (role) {
 						userRole = role.name === 'owner' ? 'owner' : 'sharee';
 					}
@@ -419,6 +442,7 @@ export class InternalHooks implements IInternalHooksClass {
 							workflowId: properties.workflow_id,
 							isManual: properties.is_manual,
 							workflowName: workflow.name,
+							metaData: runData?.data?.resultData?.metadata,
 						},
 				  })
 				: eventBus.sendWorkflowEvent({
@@ -434,6 +458,7 @@ export class InternalHooks implements IInternalHooksClass {
 							errorMessage: properties.error_message?.toString(),
 							isManual: properties.is_manual,
 							workflowName: workflow.name,
+							metaData: runData?.data?.resultData?.metadata,
 						},
 				  }),
 		);
@@ -729,6 +754,38 @@ export class InternalHooks implements IInternalHooksClass {
 		]);
 	}
 
+	async onUserLoginSuccess(userLoginData: {
+		user: User;
+		authenticationMethod: AuthenticationMethod;
+	}): Promise<void> {
+		void Promise.all([
+			eventBus.sendAuditEvent({
+				eventName: 'n8n.audit.user.login.success',
+				payload: {
+					authenticationMethod: userLoginData.authenticationMethod,
+					...userToPayload(userLoginData.user),
+				},
+			}),
+		]);
+	}
+
+	async onUserLoginFailed(userLoginData: {
+		user: string;
+		authenticationMethod: AuthenticationMethod;
+		reason?: string;
+	}): Promise<void> {
+		void Promise.all([
+			eventBus.sendAuditEvent({
+				eventName: 'n8n.audit.user.login.failed',
+				payload: {
+					authenticationMethod: userLoginData.authenticationMethod,
+					user: userLoginData.user,
+					reason: userLoginData.reason,
+				},
+			}),
+		]);
+	}
+
 	/**
 	 * Credentials
 	 */
@@ -977,5 +1034,9 @@ export class InternalHooks implements IInternalHooksClass {
 	 */
 	async onAuditGeneratedViaCli() {
 		return this.telemetry.track('Instance generated security audit via CLI command');
+	}
+
+	async onVariableCreated(createData: { variable_type: string }): Promise<void> {
+		return this.telemetry.track('User created variable', createData);
 	}
 }

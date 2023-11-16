@@ -10,7 +10,7 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
-
+import assert from 'assert';
 import { exec as callbackExec } from 'child_process';
 import { access as fsAccess } from 'fs/promises';
 import os from 'os';
@@ -31,6 +31,7 @@ import clientOAuth1 from 'oauth-1.0a';
 import {
 	BinaryDataManager,
 	Credentials,
+	LoadMappingOptions,
 	LoadNodeParameterOptions,
 	LoadNodeListSearch,
 	UserSettings,
@@ -49,6 +50,8 @@ import type {
 	ICredentialTypes,
 	ExecutionStatus,
 	IExecutionsSummary,
+	ResourceMapperFields,
+	IN8nUISettings,
 } from 'n8n-workflow';
 import { LoggerProxy, jsonParse } from 'n8n-workflow';
 
@@ -78,6 +81,7 @@ import type {
 	NodeListSearchRequest,
 	NodeParameterOptionsRequest,
 	OAuthRequest,
+	ResourceMapperRequest,
 	WorkflowRequest,
 } from '@/requests';
 import { registerController } from '@/decorators';
@@ -96,7 +100,7 @@ import {
 
 import { executionsController } from '@/executions/executions.controller';
 import { workflowStatsController } from '@/api/workflowStats.api';
-import { loadPublicApiVersions } from '@/PublicApi';
+import { isApiEnabled, loadPublicApiVersions } from '@/PublicApi';
 import {
 	getInstanceBaseUrl,
 	isEmailSetUp,
@@ -112,7 +116,6 @@ import type {
 	IDiagnosticInfo,
 	IExecutionFlattedDb,
 	IExecutionsStopData,
-	IN8nUISettings,
 } from '@/Interfaces';
 import { ActiveExecutions } from '@/ActiveExecutions';
 import {
@@ -129,7 +132,7 @@ import { WaitTracker } from '@/WaitTracker';
 import * as WebhookHelpers from '@/WebhookHelpers';
 import * as WorkflowExecuteAdditionalData from '@/WorkflowExecuteAdditionalData';
 import { toHttpNodeParameters } from '@/CurlConverterHelper';
-import { eventBusRouter } from '@/eventbus/eventBusRoutes';
+import { EventBusController } from '@/eventbus/eventBus.controller';
 import { isLogStreamingEnabled } from '@/eventbus/MessageEventBus/MessageEventBusHelper';
 import { licenseController } from './license/license.controller';
 import { Push, setupPushServer, setupPushHandler } from '@/push';
@@ -156,11 +159,22 @@ import {
 import { getSamlLoginLabel, isSamlLoginEnabled, isSamlLicensed } from './sso/saml/samlHelpers';
 import { SamlController } from './sso/saml/routes/saml.controller.ee';
 import { SamlService } from './sso/saml/saml.service.ee';
+import { variablesController } from './environments/variables/variables.controller';
 import { LdapManager } from './Ldap/LdapManager.ee';
+import { getVariablesLimit, isVariablesEnabled } from '@/environments/variables/enviromentHelpers';
+import {
+	getCurrentAuthenticationMethod,
+	isLdapCurrentAuthenticationMethod,
+	isSamlCurrentAuthenticationMethod,
+} from './sso/ssoHelpers';
+import { isVersionControlLicensed } from '@/environments/versionControl/versionControlHelper.ee';
+import { VersionControlService } from '@/environments/versionControl/versionControl.service.ee';
+import { VersionControlController } from '@/environments/versionControl/versionControl.controller.ee';
+import { VersionControlPreferencesService } from './environments/versionControl/versionControlPreferences.service.ee';
 
 const exec = promisify(callbackExec);
 
-class Server extends AbstractServer {
+export class Server extends AbstractServer {
 	endpointPresetCredentials: string;
 
 	waitTracker: WaitTracker;
@@ -187,23 +201,6 @@ class Server extends AbstractServer {
 		this.app.engine('handlebars', expressHandlebars({ defaultLayout: false }));
 		this.app.set('view engine', 'handlebars');
 		this.app.set('views', TEMPLATES_DIR);
-
-		this.loadNodesAndCredentials = Container.get(LoadNodesAndCredentials);
-		this.credentialTypes = Container.get(CredentialTypes);
-		this.nodeTypes = Container.get(NodeTypes);
-
-		this.activeExecutionsInstance = Container.get(ActiveExecutions);
-		this.waitTracker = Container.get(WaitTracker);
-		this.postHog = Container.get(PostHogClient);
-
-		this.presetCredentialsLoaded = false;
-		this.endpointPresetCredentials = config.getEnv('credentials.overwrite.endpoint');
-
-		this.push = Container.get(Push);
-
-		if (process.env.E2E_TESTS === 'true') {
-			this.app.use('/e2e', require('./api/e2e.api').e2eController);
-		}
 
 		const urlBaseWebhook = WebhookHelpers.getWebhookBaseUrl();
 		const telemetrySettings: ITelemetrySettings = {
@@ -269,6 +266,7 @@ class Server extends AbstractServer {
 					config.getEnv('userManagement.isInstanceOwnerSetUp') === false &&
 					config.getEnv('userManagement.skipInstanceOwnerSetup') === false,
 				smtpSetup: isEmailSetUp(),
+				authenticationMethod: getCurrentAuthenticationMethod(),
 			},
 			sso: {
 				saml: {
@@ -281,7 +279,7 @@ class Server extends AbstractServer {
 				},
 			},
 			publicApi: {
-				enabled: !config.getEnv('publicApi.disabled'),
+				enabled: isApiEnabled(),
 				latestVersion: 1,
 				path: config.getEnv('publicApi.path'),
 				swaggerUi: {
@@ -304,21 +302,109 @@ class Server extends AbstractServer {
 			},
 			isNpmAvailable: false,
 			allowedModules: {
-				builtIn: process.env.NODE_FUNCTION_ALLOW_BUILTIN,
-				external: process.env.NODE_FUNCTION_ALLOW_EXTERNAL,
+				builtIn: process.env.NODE_FUNCTION_ALLOW_BUILTIN?.split(',') ?? undefined,
+				external: process.env.NODE_FUNCTION_ALLOW_EXTERNAL?.split(',') ?? undefined,
 			},
 			enterprise: {
 				sharing: false,
 				ldap: false,
 				saml: false,
-				logStreaming: config.getEnv('enterprise.features.logStreaming'),
-				advancedExecutionFilters: config.getEnv('enterprise.features.advancedExecutionFilters'),
+				logStreaming: false,
+				advancedExecutionFilters: false,
+				variables: false,
+				versionControl: false,
+				auditLogs: false,
 			},
 			hideUsagePage: config.getEnv('hideUsagePage'),
 			license: {
 				environment: config.getEnv('license.tenantId') === 1 ? 'production' : 'staging',
 			},
+			variables: {
+				limit: 0,
+			},
 		};
+	}
+
+	async start() {
+		this.loadNodesAndCredentials = Container.get(LoadNodesAndCredentials);
+		this.credentialTypes = Container.get(CredentialTypes);
+		this.nodeTypes = Container.get(NodeTypes);
+
+		this.activeExecutionsInstance = Container.get(ActiveExecutions);
+		this.waitTracker = Container.get(WaitTracker);
+		this.postHog = Container.get(PostHogClient);
+
+		this.presetCredentialsLoaded = false;
+		this.endpointPresetCredentials = config.getEnv('credentials.overwrite.endpoint');
+
+		this.push = Container.get(Push);
+
+		if (process.env.E2E_TESTS === 'true') {
+			this.app.use('/e2e', require('./api/e2e.api').e2eController);
+		}
+
+		await super.start();
+
+		const cpus = os.cpus();
+		const binaryDataConfig = config.getEnv('binaryDataManager');
+		const diagnosticInfo: IDiagnosticInfo = {
+			basicAuthActive: config.getEnv('security.basicAuth.active'),
+			databaseType: config.getEnv('database.type'),
+			disableProductionWebhooksOnMainProcess: config.getEnv(
+				'endpoints.disableProductionWebhooksOnMainProcess',
+			),
+			notificationsEnabled: config.getEnv('versionNotifications.enabled'),
+			versionCli: N8N_VERSION,
+			systemInfo: {
+				os: {
+					type: os.type(),
+					version: os.version(),
+				},
+				memory: os.totalmem() / 1024,
+				cpus: {
+					count: cpus.length,
+					model: cpus[0].model,
+					speed: cpus[0].speed,
+				},
+			},
+			executionVariables: {
+				executions_process: config.getEnv('executions.process'),
+				executions_mode: config.getEnv('executions.mode'),
+				executions_timeout: config.getEnv('executions.timeout'),
+				executions_timeout_max: config.getEnv('executions.maxTimeout'),
+				executions_data_save_on_error: config.getEnv('executions.saveDataOnError'),
+				executions_data_save_on_success: config.getEnv('executions.saveDataOnSuccess'),
+				executions_data_save_on_progress: config.getEnv('executions.saveExecutionProgress'),
+				executions_data_save_manual_executions: config.getEnv(
+					'executions.saveDataManualExecutions',
+				),
+				executions_data_prune: config.getEnv('executions.pruneData'),
+				executions_data_max_age: config.getEnv('executions.pruneDataMaxAge'),
+				executions_data_prune_timeout: config.getEnv('executions.pruneDataTimeout'),
+			},
+			deploymentType: config.getEnv('deployment.type'),
+			binaryDataMode: binaryDataConfig.mode,
+			n8n_multi_user_allowed: isUserManagementEnabled(),
+			smtp_set_up: config.getEnv('userManagement.emails.mode') === 'smtp',
+			ldap_allowed: isLdapCurrentAuthenticationMethod(),
+			saml_enabled: isSamlCurrentAuthenticationMethod(),
+		};
+
+		// Set up event handling
+		initEvents();
+
+		if (inDevelopment && process.env.N8N_DEV_RELOAD === 'true') {
+			const { reloadNodesAndCredentials } = await import('@/ReloadNodesAndCredentials');
+			await reloadNodesAndCredentials(this.loadNodesAndCredentials, this.nodeTypes, this.push);
+		}
+
+		void Db.collections.Workflow.findOne({
+			select: ['createdAt'],
+			order: { createdAt: 'ASC' },
+			where: {},
+		}).then(async (workflow) =>
+			Container.get(InternalHooks).onServerStarted(diagnosticInfo, workflow?.createdAt),
+		);
 	}
 
 	/**
@@ -328,6 +414,7 @@ class Server extends AbstractServer {
 		// refresh user management status
 		Object.assign(this.frontendSettings.userManagement, {
 			enabled: isUserManagementEnabled(),
+			authenticationMethod: getCurrentAuthenticationMethod(),
 			showSetupOnFirstLoad:
 				config.getEnv('userManagement.disabled') === false &&
 				config.getEnv('userManagement.isInstanceOwnerSetUp') === false &&
@@ -342,6 +429,8 @@ class Server extends AbstractServer {
 			ldap: isLdapEnabled(),
 			saml: isSamlLicensed(),
 			advancedExecutionFilters: isAdvancedExecutionFiltersEnabled(),
+			variables: isVariablesEnabled(),
+			versionControl: isVersionControlLicensed(),
 		});
 
 		if (isLdapEnabled()) {
@@ -358,10 +447,13 @@ class Server extends AbstractServer {
 			});
 		}
 
+		if (isVariablesEnabled()) {
+			this.frontendSettings.variables.limit = getVariablesLimit();
+		}
+
 		if (config.get('nodes.packagesMissing').length > 0) {
 			this.frontendSettings.missingPackages = true;
 		}
-
 		return this.frontendSettings;
 	}
 
@@ -375,8 +467,11 @@ class Server extends AbstractServer {
 		const mailer = Container.get(UserManagementMailer);
 		const postHog = this.postHog;
 		const samlService = Container.get(SamlService);
+		const versionControlService = Container.get(VersionControlService);
+		const versionControlPreferencesService = Container.get(VersionControlPreferencesService);
 
 		const controllers: object[] = [
+			new EventBusController(),
 			new AuthController({ config, internalHooks, repositories, logger, postHog }),
 			new OwnerController({ config, internalHooks, repositories, logger }),
 			new MeController({ externalHooks, internalHooks, repositories, logger }),
@@ -402,6 +497,7 @@ class Server extends AbstractServer {
 				postHog,
 			}),
 			new SamlController(samlService),
+			new VersionControlController(versionControlService, versionControlPreferencesService),
 		];
 
 		if (isLdapEnabled()) {
@@ -421,13 +517,15 @@ class Server extends AbstractServer {
 	async configure(): Promise<void> {
 		configureMetrics(this.app);
 
+		this.instanceId = await UserSettings.getInstanceId();
+
 		this.frontendSettings.isNpmAvailable = await exec('npm --version')
 			.then(() => true)
 			.catch(() => false);
 
 		this.frontendSettings.versionCli = N8N_VERSION;
 
-		this.frontendSettings.instanceId = await UserSettings.getInstanceId();
+		this.frontendSettings.instanceId = this.instanceId;
 
 		await this.externalHooks.run('frontend.settings', [this.frontendSettings]);
 
@@ -444,28 +542,33 @@ class Server extends AbstractServer {
 			this.endpointWebhook,
 			this.endpointWebhookTest,
 			this.endpointPresetCredentials,
-			config.getEnv('publicApi.disabled') ? publicApiEndpoint : '',
+			isApiEnabled() ? '' : publicApiEndpoint,
 			...excludeEndpoints.split(':'),
 		].filter((u) => !!u);
+
+		assert(
+			!ignoredEndpoints.includes(this.restEndpoint),
+			`REST endpoint cannot be set to any of these values: ${ignoredEndpoints.join()} `,
+		);
 
 		// eslint-disable-next-line no-useless-escape
 		const authIgnoreRegex = new RegExp(`^\/(${ignoredEndpoints.join('|')})\/?.*$`);
 
 		// Check for basic auth credentials if activated
 		if (config.getEnv('security.basicAuth.active')) {
-			await setupBasicAuth(this.app, config, authIgnoreRegex);
+			setupBasicAuth(this.app, config, authIgnoreRegex);
 		}
 
 		// Check for and validate JWT if configured
 		if (config.getEnv('security.jwtAuth.active')) {
-			await setupExternalJWTAuth(this.app, config, authIgnoreRegex);
+			setupExternalJWTAuth(this.app, config, authIgnoreRegex);
 		}
 
 		// ----------------------------------------
 		// Public API
 		// ----------------------------------------
 
-		if (!config.getEnv('publicApi.disabled')) {
+		if (isApiEnabled()) {
 			const { apiRouters, apiLatestVersion } = await loadPublicApiVersions(publicApiEndpoint);
 			this.app.use(...apiRouters);
 			this.frontendSettings.publicApi.latestVersion = apiLatestVersion;
@@ -521,15 +624,32 @@ class Server extends AbstractServer {
 
 		// initialize SamlService if it is licensed, even if not enabled, to
 		// set up the initial environment
-		if (isSamlLicensed()) {
-			try {
-				await Container.get(SamlService).init();
-			} catch (error) {
-				LoggerProxy.error(`SAML initialization failed: ${error.message}`);
-			}
+		try {
+			await Container.get(SamlService).init();
+		} catch (error) {
+			LoggerProxy.warn(`SAML initialization failed: ${error.message}`);
 		}
 
 		// ----------------------------------------
+		// Variables
+		// ----------------------------------------
+
+		this.app.use(`/${this.restEndpoint}/variables`, variablesController);
+
+		// ----------------------------------------
+		// Version Control
+		// ----------------------------------------
+
+		// initialize SamlService if it is licensed, even if not enabled, to
+		// set up the initial environment
+		try {
+			await Container.get(VersionControlService).init();
+		} catch (error) {
+			LoggerProxy.warn(`Version Control initialization failed: ${error.message}`);
+		}
+
+		// ----------------------------------------
+
 		// Returns parameter values which normally get loaded from an external API or
 		// get generated dynamically
 		this.app.get(
@@ -640,6 +760,58 @@ class Server extends AbstractServer {
 			),
 		);
 
+		this.app.get(
+			`/${this.restEndpoint}/get-mapping-fields`,
+			ResponseHelper.send(
+				async (
+					req: ResourceMapperRequest,
+					res: express.Response,
+				): Promise<ResourceMapperFields | undefined> => {
+					const nodeTypeAndVersion = jsonParse(
+						req.query.nodeTypeAndVersion,
+					) as INodeTypeNameVersion;
+
+					const { path, methodName } = req.query;
+
+					if (!req.query.currentNodeParameters) {
+						throw new ResponseHelper.BadRequestError(
+							'Parameter currentNodeParameters is required.',
+						);
+					}
+
+					const currentNodeParameters = jsonParse(
+						req.query.currentNodeParameters,
+					) as INodeParameters;
+
+					let credentials: INodeCredentials | undefined;
+
+					if (req.query.credentials) {
+						credentials = jsonParse(req.query.credentials);
+					}
+
+					const loadMappingOptionsInstance = new LoadMappingOptions(
+						nodeTypeAndVersion,
+						this.nodeTypes,
+						path,
+						currentNodeParameters,
+						credentials,
+					);
+
+					const additionalData = await WorkflowExecuteAdditionalData.getBase(
+						req.user.id,
+						currentNodeParameters,
+					);
+
+					const fields = await loadMappingOptionsInstance.getOptionsViaMethodName(
+						methodName,
+						additionalData,
+					);
+
+					return fields;
+				},
+			),
+		);
+
 		// ----------------------------------------
 		// Active Workflows
 		// ----------------------------------------
@@ -648,8 +820,7 @@ class Server extends AbstractServer {
 		this.app.get(
 			`/${this.restEndpoint}/active`,
 			ResponseHelper.send(async (req: WorkflowRequest.GetAllActive) => {
-				const activeWorkflows = await this.activeWorkflowRunner.getActiveWorkflows(req.user);
-				return activeWorkflows.map(({ id }) => id);
+				return this.activeWorkflowRunner.getActiveWorkflows(req.user);
 			}),
 		);
 
@@ -1076,7 +1247,7 @@ class Server extends AbstractServer {
 					throw new ResponseHelper.NotFoundError('Execution not found');
 				}
 
-				const execution = await Db.collections.Execution.findOne({
+				const execution = await Db.collections.Execution.exist({
 					where: {
 						id: executionId,
 						workflowId: In(sharedWorkflowIds),
@@ -1229,8 +1400,6 @@ class Server extends AbstractServer {
 		if (!eventBus.isInitialized) {
 			await eventBus.initialize();
 		}
-		// add Event Bus REST endpoints
-		this.app.use(`/${this.restEndpoint}/eventbus`, eventBusRouter);
 
 		// ----------------------------------------
 		// Webhooks
@@ -1329,67 +1498,4 @@ class Server extends AbstractServer {
 		const { restEndpoint, server, app } = this;
 		setupPushServer(restEndpoint, server, app);
 	}
-}
-
-export async function start(): Promise<void> {
-	const app = new Server();
-	await app.start();
-
-	const cpus = os.cpus();
-	const binaryDataConfig = config.getEnv('binaryDataManager');
-	const diagnosticInfo: IDiagnosticInfo = {
-		basicAuthActive: config.getEnv('security.basicAuth.active'),
-		databaseType: config.getEnv('database.type'),
-		disableProductionWebhooksOnMainProcess: config.getEnv(
-			'endpoints.disableProductionWebhooksOnMainProcess',
-		),
-		notificationsEnabled: config.getEnv('versionNotifications.enabled'),
-		versionCli: N8N_VERSION,
-		systemInfo: {
-			os: {
-				type: os.type(),
-				version: os.version(),
-			},
-			memory: os.totalmem() / 1024,
-			cpus: {
-				count: cpus.length,
-				model: cpus[0].model,
-				speed: cpus[0].speed,
-			},
-		},
-		executionVariables: {
-			executions_process: config.getEnv('executions.process'),
-			executions_mode: config.getEnv('executions.mode'),
-			executions_timeout: config.getEnv('executions.timeout'),
-			executions_timeout_max: config.getEnv('executions.maxTimeout'),
-			executions_data_save_on_error: config.getEnv('executions.saveDataOnError'),
-			executions_data_save_on_success: config.getEnv('executions.saveDataOnSuccess'),
-			executions_data_save_on_progress: config.getEnv('executions.saveExecutionProgress'),
-			executions_data_save_manual_executions: config.getEnv('executions.saveDataManualExecutions'),
-			executions_data_prune: config.getEnv('executions.pruneData'),
-			executions_data_max_age: config.getEnv('executions.pruneDataMaxAge'),
-			executions_data_prune_timeout: config.getEnv('executions.pruneDataTimeout'),
-		},
-		deploymentType: config.getEnv('deployment.type'),
-		binaryDataMode: binaryDataConfig.mode,
-		n8n_multi_user_allowed: isUserManagementEnabled(),
-		smtp_set_up: config.getEnv('userManagement.emails.mode') === 'smtp',
-		ldap_allowed: isLdapEnabled(),
-	};
-
-	// Set up event handling
-	initEvents();
-
-	if (inDevelopment && process.env.N8N_DEV_RELOAD === 'true') {
-		const { reloadNodesAndCredentials } = await import('@/ReloadNodesAndCredentials');
-		await reloadNodesAndCredentials(app.loadNodesAndCredentials, app.nodeTypes, app.push);
-	}
-
-	void Db.collections.Workflow.findOne({
-		select: ['createdAt'],
-		order: { createdAt: 'ASC' },
-		where: {},
-	}).then(async (workflow) =>
-		Container.get(InternalHooks).onServerStarted(diagnosticInfo, workflow?.createdAt),
-	);
 }
